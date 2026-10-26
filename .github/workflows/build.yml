@@ -1,0 +1,26 @@
+name: build-plugin
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile
+        run: cl /nologo /LD /O2 /EHsc /MD dlc_license_plugin.cpp /link /OUT:dlc_license.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlc_license
+          path: dlc_license.dll
