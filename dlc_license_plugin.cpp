@@ -1,6 +1,7 @@
-// dlc_license_plugin.cpp — UCOnline2 plugin (ABI v1)
+// dlc_license_plugin.cpp — UCOnline2 plugin (ABI v1) + diagnostics
 // Hooks ISteamUser::UserHasLicenseForApp + GetEncryptedAppTicket so a
 // Spacewar-spoofed session stays stable and Elden Ring DLC reads as owned.
+// Writes plugin_log.txt next to the game exe for diagnosis.
 // Build x64 Release -> dlc_license.dll, drop in the plugins folder.
 
 #define WIN32_LEAN_AND_MEAN
@@ -8,11 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdarg>
 
-// ------------------------------------------------------------------
-// If you have MinHook, define HAVE_MINHOOK and add the MinHook lib.
-// Otherwise the manual trampoline hook below is used.
-// ------------------------------------------------------------------
+// If you have MinHook, uncomment this and link MinHook.
 // #define HAVE_MINHOOK
 // #include "MinHook.h"
 
@@ -20,17 +19,14 @@
   #define HOOK_CREATE(t,p,f)  MH_CreateHook((LPVOID)(t), (LPVOID)(p), (LPVOID*)(f))
   #define HOOK_ENABLE(t)      MH_EnableHook((LPVOID)(t))
 #else
-  // ---- tiny manual x64 detour --------------------------------------
   struct Detour { void* target; void* hook; unsigned char orig[16]; bool on; };
   static Detour* g_detours[8]; static int g_detour_count = 0;
-
   static bool MakeDetour(void* target, void* hook, Detour* d) {
       d->target = target; d->hook = hook; d->on = false;
       memcpy(d->orig, target, 16);
       DWORD old;
       VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &old);
       unsigned char* p = (unsigned char*)target;
-      // mov rax, hook ; jmp rax ; nop...
       p[0] = 0x48; p[1] = 0xB8;
       *(void**)(p + 2) = hook;
       p[10] = 0xFF; p[11] = 0xE0;
@@ -43,16 +39,37 @@
   #define HOOK_ENABLE(t)      ((void)0)
 #endif
 
-// ------------------------------------------------------------------
-// UCO v1 plugin ABI (as described in the repo readme).
-// Field names *should* match; if the compiler complains, adjust the
-// struct to your uco_plugin.h.
-// ------------------------------------------------------------------
+// ---------------- logging ----------------
+static FILE* g_log = nullptr;
+
+static void LogInit() {
+    if (g_log) return;
+    char exe[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char* s = strrchr(exe, '\\'); if (s) *(s+1)=0;
+    char path[MAX_PATH]{};
+    snprintf(path, MAX_PATH, "%splugin_log.txt", exe);
+    fopen_s(&g_log, path, "a");
+}
+
+static void Log(const char* fmt, ...) {
+    LogInit();
+    if (!g_log) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(g_log, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_log);
+    fflush(g_log);
+}
+
+// ---------------- ABI ----------------
 struct UCO_PluginContext {
-    void* steamUser;       // ISteamUser*
-    void* steamApps;       // ISteamApps*
-    void* steamUserStats;  // ISteamUserStats*
-    void* steamUtils;      // ISteamUtils*
+    void* steamUser;
+    void* steamApps;
+    void* steamUserStats;
+    void* steamUtils;
     uint32_t appId;
     uint32_t ogAppId;
     void (*log)(const char*);
@@ -60,36 +77,31 @@ struct UCO_PluginContext {
 };
 
 static UCO_PluginContext g_ctx{};
-static void Log(const char* m) { if (g_ctx.log) g_ctx.log(m); }
 
-// Elden Ring base + DLC ids we want to report as owned.
 static const uint32_t kOwned[] = { 1245620u, 2778580u, 2778590u, 3655690u };
 static bool IsOwned(uint32_t id) {
     for (uint32_t v : kOwned) if (v == id) return true;
     return false;
 }
 
-// ---- vtable slot indices for ISteamUser (Valve SDK) ---------------
-// 1 = GetHSteamUser, 2 = LoggedOn, 3 = GetSteamID,
-// ... 17 = UserHasLicenseForApp, 18 = GetAuthSessionTicket,
-// 19 = BeginAuthSession, 20 = EndAuthSession, 21 = CancelAuthTicket,
-// 22 = IsUserInGame, 23 = GetEncryptedAppTicket
 enum { SLOT_UserHasLicenseForApp = 17, SLOT_GetEncryptedAppTicket = 23 };
 
-static bool  (__fastcall *o_UserHasLicenseForApp)(void*, uint32_t, uint32_t) = nullptr;
-static bool  (__fastcall *o_GetEncryptedAppTicket)(void*, void*, uint32_t, uint32_t*, uint32_t*) = nullptr;
+static bool (__fastcall *o_UserHasLicenseForApp)(void*, uint32_t, uint32_t) = nullptr;
+static bool (__fastcall *o_GetEncryptedAppTicket)(void*, void*, uint32_t, uint32_t*, uint32_t*) = nullptr;
 
 static bool __fastcall H_UserHasLicenseForApp(void* self, uint32_t steamID, uint32_t appId) {
-    if (IsOwned(appId)) { Log("UserHasLicenseForApp -> TRUE"); return true; }
-    return o_UserHasLicenseForApp ? o_UserHasLicenseForApp(self, steamID, appId) : false;
+    bool owned = IsOwned(appId);
+    bool real = o_UserHasLicenseForApp ? o_UserHasLicenseForApp(self, steamID, appId) : false;
+    Log("UserHasLicenseForApp appId=%u owned_spoof=%d real=%d -> %d",
+        appId, owned, real, (owned || real));
+    return owned || real;
 }
 
 static bool __fastcall H_GetEncryptedAppTicket(void* self, void* buf, uint32_t max,
                                                uint32_t* written, uint32_t* crc) {
-    // Ask the real one first; if it produced nothing, fabricate a ticket.
     bool ok = o_GetEncryptedAppTicket ? o_GetEncryptedAppTicket(self, buf, max, written, crc) : false;
+    Log("GetEncryptedAppTicket real_ok=%d written=%u", ok, written ? *written : 0);
     if (ok && written && *written > 0) return true;
-
     if (buf && written && max >= 8) {
         memset(buf, 0xA5, max);
         *written = 8;
@@ -100,13 +112,13 @@ static bool __fastcall H_GetEncryptedAppTicket(void* self, void* buf, uint32_t m
     return false;
 }
 
-// ------------------------------------------------------------------
 static bool HookVtableSlot(void* iface, int slot, void* hook, void** orig) {
-    if (!iface) return false;
+    if (!iface) { Log("HookVtableSlot: iface null (slot %d)", slot); return false; }
     void** vt = *(void***)iface;
-    if (!vt) return false;
+    if (!vt) { Log("HookVtableSlot: vtable null (slot %d)", slot); return false; }
     void* target = vt[slot];
-    if (!target) return false;
+    if (!target) { Log("HookVtableSlot: target null (slot %d)", slot); return false; }
+    Log("HookVtableSlot slot=%d target=%p", slot, target);
     *orig = target;
     DWORD old;
     VirtualProtect(vt, (slot + 1) * sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
@@ -116,11 +128,13 @@ static bool HookVtableSlot(void* iface, int slot, void* hook, void** orig) {
 }
 
 extern "C" __declspec(dllexport) int UCO_PluginInit(const UCO_PluginContext* ctx) {
-    if (!ctx) return 1;
+    Log("==== UCO_PluginInit called ====");
+    if (!ctx) { Log("ctx == null"); return 1; }
     g_ctx = *ctx;
-    Log("dlc_license_plugin: init");
+    Log("ctx: steamUser=%p steamApps=%p appId=%u ogAppId=%u",
+        ctx->steamUser, ctx->steamApps, ctx->appId, ctx->ogAppId);
 
-    if (!g_ctx.steamUser) { Log("no steamUser iface"); return 2; }
+    if (!g_ctx.steamUser) { Log("no steamUser iface -> abort"); return 2; }
 
     bool a = HookVtableSlot(g_ctx.steamUser, SLOT_UserHasLicenseForApp,
                             (void*)&H_UserHasLicenseForApp,
@@ -134,10 +148,13 @@ extern "C" __declspec(dllexport) int UCO_PluginInit(const UCO_PluginContext* ctx
 }
 
 extern "C" __declspec(dllexport) void UCO_PluginShutdown(void) {
-    Log("dlc_license_plugin: shutdown");
+    Log("==== UCO_PluginShutdown ====");
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
-    if (r == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h);
+    if (r == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        Log("DllMain: attached, module=%p", (void*)h);
+    }
     return TRUE;
 }
